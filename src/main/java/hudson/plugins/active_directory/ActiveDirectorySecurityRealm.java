@@ -23,10 +23,9 @@
  */
 package hudson.plugins.active_directory;
 
-import static hudson.Util.fixEmpty;
-import static hudson.plugins.active_directory.ActiveDirectoryUnixAuthenticationProvider.toDC;
-
+import com.sun.jndi.ldap.LdapCtxFactory;
 import com4j.typelibs.ado20.ClassFactory;
+import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import groovy.lang.Binding;
 import hudson.Extension;
 import hudson.Functions;
@@ -40,20 +39,23 @@ import hudson.security.SecurityRealm;
 import hudson.security.TokenBasedRememberMeServices2;
 import hudson.util.FormValidation;
 import hudson.util.ListBoxModel;
-import hudson.util.ListBoxModel.Option;
 import hudson.util.Secret;
 import hudson.util.spring.BeanBuilder;
-
-import java.io.IOException;
-import java.io.PrintWriter;
-import java.io.StringWriter;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Collections;
-import java.util.Hashtable;
-import java.util.List;
-import java.util.logging.Level;
-import java.util.logging.Logger;
+import org.acegisecurity.Authentication;
+import org.acegisecurity.AuthenticationException;
+import org.acegisecurity.AuthenticationManager;
+import org.acegisecurity.BadCredentialsException;
+import org.acegisecurity.providers.UsernamePasswordAuthenticationToken;
+import org.acegisecurity.userdetails.UserDetails;
+import org.acegisecurity.userdetails.UserDetailsService;
+import org.acegisecurity.userdetails.UsernameNotFoundException;
+import org.apache.commons.io.IOUtils;
+import org.kohsuke.stapler.DataBoundConstructor;
+import org.kohsuke.stapler.QueryParameter;
+import org.kohsuke.stapler.StaplerRequest;
+import org.kohsuke.stapler.StaplerResponse;
+import org.springframework.dao.DataAccessException;
+import org.springframework.web.context.WebApplicationContext;
 
 import javax.naming.Context;
 import javax.naming.NamingEnumeration;
@@ -69,23 +71,20 @@ import javax.net.ssl.SSLSocketFactory;
 import javax.servlet.ServletException;
 import javax.servlet.http.HttpServletRequest;
 import javax.servlet.http.HttpServletResponse;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.PrintWriter;
+import java.io.StringWriter;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.Hashtable;
+import java.util.List;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 
-import org.acegisecurity.Authentication;
-import org.acegisecurity.AuthenticationException;
-import org.acegisecurity.AuthenticationManager;
-import org.acegisecurity.BadCredentialsException;
-import org.acegisecurity.providers.UsernamePasswordAuthenticationToken;
-import org.acegisecurity.userdetails.UserDetails;
-import org.acegisecurity.userdetails.UserDetailsService;
-import org.acegisecurity.userdetails.UsernameNotFoundException;
-import org.kohsuke.stapler.DataBoundConstructor;
-import org.kohsuke.stapler.QueryParameter;
-import org.kohsuke.stapler.StaplerRequest;
-import org.kohsuke.stapler.StaplerResponse;
-import org.springframework.dao.DataAccessException;
-import org.springframework.web.context.WebApplicationContext;
-
-import com.sun.jndi.ldap.LdapCtxFactory;
+import static hudson.Util.*;
+import static hudson.plugins.active_directory.ActiveDirectoryUnixAuthenticationProvider.*;
 
 /**
  * {@link SecurityRealm} that talks to Active Directory.
@@ -144,16 +143,24 @@ public class ActiveDirectorySecurityRealm extends AbstractPasswordBasedSecurityR
     public final boolean removeIrrelevantGroups;
 
     public ActiveDirectorySecurityRealm(String domain, String site, String bindName, String bindPassword, String server) {
-        this(domain,site,bindName,bindPassword,server,GroupLookupStrategy.AUTO,false);
+        this(domain, site, bindName, bindPassword, server, GroupLookupStrategy.AUTO, false);
     }
 
     public ActiveDirectorySecurityRealm(String domain, String site, String bindName, String bindPassword, String server, GroupLookupStrategy groupLookupStrategy) {
         this(domain,site,bindName,bindPassword,server,groupLookupStrategy,false);
     }
 
-    @DataBoundConstructor
     public ActiveDirectorySecurityRealm(String domain, String site, String bindName,
                                         String bindPassword, String server, GroupLookupStrategy groupLookupStrategy, boolean removeIrrelevantGroups) {
+        this(domain,site,bindName,bindPassword,server,groupLookupStrategy,removeIrrelevantGroups,domain!=null);
+    }
+    
+    @DataBoundConstructor
+    // as Java signature, this binding doesn't make sense, so please don't use this constructor
+    public ActiveDirectorySecurityRealm(String domain, String site, String bindName,
+                                        String bindPassword, String server, GroupLookupStrategy groupLookupStrategy, boolean removeIrrelevantGroups, Boolean customDomain) {
+        if (customDomain!=null && !customDomain)
+            domain = null;
         this.domain = fixEmpty(domain);
         this.site = fixEmpty(site);
         this.bindName = fixEmpty(bindName);
@@ -179,10 +186,16 @@ public class ActiveDirectorySecurityRealm extends AbstractPasswordBasedSecurityR
         BeanBuilder builder = new BeanBuilder(getClass().getClassLoader());
         Binding binding = new Binding();
         binding.setVariable("realm", this);
-        builder.parse(getClass().getResourceAsStream("ActiveDirectory.groovy"), binding);
+        InputStream i = getClass().getResourceAsStream("ActiveDirectory.groovy");
+        try {
+            builder.parse(i, binding);
+        } finally {
+            IOUtils.closeQuietly(i);
+        }
         WebApplicationContext context = builder.createApplicationContext();
 
-        final AbstractActiveDirectoryAuthenticationProvider adp = findBean(AbstractActiveDirectoryAuthenticationProvider.class, context);
+        //final AbstractActiveDirectoryAuthenticationProvider adp = findBean(AbstractActiveDirectoryAuthenticationProvider.class, context);
+        findBean(AbstractActiveDirectoryAuthenticationProvider.class, context); //Keeping the call because there might be side effects?
         final UserDetailsService uds = findBean(UserDetailsService.class, context);
 
         TokenBasedRememberMeServices2 rms = new TokenBasedRememberMeServices2() {
@@ -535,7 +548,7 @@ public class ActiveDirectorySecurityRealm extends AbstractPasswordBasedSecurityR
 
         // domain name prefixes
         // see http://technet.microsoft.com/en-us/library/cc759550(WS.10).aspx
-        private static final List<String> CANDIDATES = Arrays.asList("_gc._tcp.","_ldap._tcp.");
+        private static final List<String> CANDIDATES = Arrays.asList("_gc._tcp.", "_ldap._tcp.");
 
         /**
          * Use DNS and obtains the LDAP servers that we should try.
@@ -595,8 +608,9 @@ public class ActiveDirectorySecurityRealm extends AbstractPasswordBasedSecurityR
                         this.priority = priority;
                     }
 
+                    @SuppressFBWarnings(value = "EQ_COMPARETO_USE_OBJECT_EQUALS", justification = "Weird and unpredictable behaviour intentional for load balancing.")
                     public int compareTo(PrioritizedSocketInfo that) {
-                        return that.priority-this.priority; // sort them so that bigger priority comes first
+                        return that.priority - this.priority; // sort them so that bigger priority comes first
                     }
                 }
                 List<PrioritizedSocketInfo> plist = new ArrayList<PrioritizedSocketInfo>();
@@ -634,7 +648,7 @@ public class ActiveDirectorySecurityRealm extends AbstractPasswordBasedSecurityR
                 throw x;
             }
 
-            LOGGER.fine(ldapServer+" resolved to "+result);
+            LOGGER.fine(ldapServer + " resolved to " + result);
             return result;
         }
     }
@@ -672,6 +686,7 @@ public class ActiveDirectorySecurityRealm extends AbstractPasswordBasedSecurityR
      * @deprecated as of 1.28
      *      Use the UI field.
      */
+    @SuppressFBWarnings(value = "MS_SHOULD_BE_FINAL", justification = "Diagnostic fields are left mutable so that groovy console can be used to dynamically turn/off probes.")
     public static String DOMAIN_CONTROLLERS = System.getProperty(ActiveDirectorySecurityRealm.class.getName()+".domainControllers");
 
     /**
@@ -682,5 +697,6 @@ public class ActiveDirectorySecurityRealm extends AbstractPasswordBasedSecurityR
      * One legitimate use case is when the domain controller is Windows 2000, which doesn't support TLS
      * (according to http://support.microsoft.com/kb/321051).
      */
+    @SuppressFBWarnings(value = "MS_SHOULD_BE_FINAL", justification = "Diagnostic fields are left mutable so that groovy console can be used to dynamically turn/off probes.")
     public static boolean FORCE_LDAPS = Boolean.getBoolean(ActiveDirectorySecurityRealm.class.getName()+".forceLdaps");
 }
